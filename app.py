@@ -1,12 +1,12 @@
 """
-Streamlit 2-D RBF interpolation of monthly water-level data.
+2-D RBF interpolation of monthly groundwater levels (Streamlit).
 
-Data:
-- Water levels:   Monthly_Sea_Level_Data.csv  (columns: Date, W1…W20)
-- Well coords:    wells.csv  (columns: well, lat, lon)
-
-Author: <your-name>
+Data sources (GitHub raw):
+  • Water levels  : https://raw.githubusercontent.com/hawkarabdulhaq/waterdemo/main/Monthly_Sea_Level_Data.csv
+  • Well coords   : https://raw.githubusercontent.com/hawkarabdulhaq/waterdemo/main/wells.csv
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,8 @@ import streamlit as st
 from scipy.interpolate import Rbf
 
 # ---------------------------------------------------------------------------
-
+# URLs – change here if the repo path ever moves
+# ---------------------------------------------------------------------------
 LEVELS_URL = (
     "https://raw.githubusercontent.com/"
     "hawkarabdulhaq/waterdemo/main/Monthly_Sea_Level_Data.csv"
@@ -26,128 +27,131 @@ COORDS_URL = (
 )
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 @st.cache_data
 def load_levels() -> pd.DataFrame:
+    """Download water-level CSV and parse dates."""
     df = pd.read_csv(LEVELS_URL, parse_dates=["Date"])
     return df
 
 
 @st.cache_data
 def load_coords() -> pd.DataFrame:
+    """Download well-coordinate CSV and normalise column names."""
     df = pd.read_csv(COORDS_URL)
 
-    # --- Rename to canonical columns ---------------------------------------
-    rename_map = {}
+    # --- Map possible column names to standard ones ------------------------
+    rename = {}
     for col in df.columns:
         c = col.lower()
         if c in {"well", "name", "id"}:
-            rename_map[col] = "well"
-        elif c in {"lat", "latitude", "y"}:
-            rename_map[col] = "lat"
-        elif c in {"lon", "lng", "longitude", "x"}:
-            rename_map[col] = "lon"
-    df = df.rename(columns=rename_map)
+            rename[col] = "well"
+        elif c in {"lat", "latitude", "y", "northing"}:
+            rename[col] = "lat"
+        elif c in {"lon", "lng", "longitude", "x", "easting"}:
+            rename[col] = "lon"
+    df = df.rename(columns=rename)
 
-    needed = {"well", "lat", "lon"}
-    if not needed.issubset(df.columns):
-        missing = ", ".join(sorted(needed - set(df.columns)))
-        st.error(f"`wells.csv` is missing column(s): {missing}")
-        st.stop()
+    # --- Basic sanity check -------------------------------------------------
+    for must in ("well", "lat", "lon"):
+        if must not in df.columns:
+            st.error(f"`wells.csv` needs a “{must}” column (case-insensitive).")
+            st.stop()
 
     return df[["well", "lat", "lon"]]
 
 
-def rbf_interpolate(lon, lat, z, grid_res=200):
-    """Return (grid_lon, grid_lat, grid_z) on regular mesh via thin-plate RBF."""
+def rbf_surface(lon: np.ndarray, lat: np.ndarray, z: np.ndarray, res: int):
+    """Return meshgrid (lon_g, lat_g, z_g) using thin-plate-spline RBF."""
     rbf = Rbf(lon, lat, z, function="thin_plate")
-
-    lon_min, lon_max = lon.min(), lon.max()
-    lat_min, lat_max = lat.min(), lat.max()
-    grid_lon, grid_lat = np.meshgrid(
-        np.linspace(lon_min, lon_max, grid_res),
-        np.linspace(lat_min, lat_max, grid_res),
+    lon_g, lat_g = np.meshgrid(
+        np.linspace(lon.min(), lon.max(), res),
+        np.linspace(lat.min(), lat.max(), res),
     )
-    grid_z = rbf(grid_lon, grid_lat)
-    return grid_lon, grid_lat, grid_z
+    z_g = rbf(lon_g, lat_g)
+    return lon_g, lat_g, z_g
 
 
 # ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    st.title("2-D Water-Table Interpolation (RBF)")
-
+    st.title("2-D Water-Table Map (RBF)")
     st.caption(
-        "Plots a thin-plate-spline surface from wells **W1–W20** for any month."
+        "Interactively maps groundwater levels for wells **W1 … W20** "
+        "using a thin-plate-spline Radial Basis Function surface."
     )
 
-    # ---- Load data ---------------------------------------------------------
-    levels_df = load_levels()
-    coords_df = load_coords()
+    # ---- Load data --------------------------------------------------------
+    levels = load_levels()
+    coords = load_coords()
+    well_cols = [c for c in levels.columns if c.upper().startswith("W")]
 
-    well_cols = [c for c in levels_df.columns if c.startswith("W")]
-    if len(well_cols) == 0:
-        st.error("No well columns (W1…Wn) found in levels CSV.")
+    if not well_cols:
+        st.error("No well columns (W1 … Wn) found in the levels CSV.")
         st.stop()
 
-    # ---- Sidebar controls --------------------------------------------------
+    # ---- Sidebar controls -------------------------------------------------
     st.sidebar.header("Controls")
-    date_strings = levels_df["Date"].dt.strftime("%Y-m-d")
-    date_choice = st.sidebar.selectbox("Month", date_strings, index=len(date_strings) - 1)
-    grid_res = st.sidebar.slider("Grid resolution (pixels)", 100, 400, 250, 50)
-    contour_levels = st.sidebar.slider("Contour levels", 5, 30, 15, 1)
+    date_options = levels["Date"].dt.strftime("%Y-m-d")
+    date_sel = st.sidebar.selectbox("Month", date_options, index=len(date_options) - 1)
+    grid_res = st.sidebar.slider("Grid resolution (pixels)", 100, 500, 250, 50)
+    n_levels = st.sidebar.slider("Number of contour levels", 5, 30, 15, 1)
 
-    # ---- Extract selected month -------------------------------------------
-    month_data = levels_df.loc[date_strings == date_choice, well_cols].iloc[0]
-    month_long = (
-        month_data.rename_axis("well")
+    # ---- Extract chosen month & merge with coords -------------------------
+    row = levels.loc[date_options == date_sel, well_cols].iloc[0]
+    df_month = (
+        row.rename_axis("well")
         .reset_index(name="level")
-        .merge(coords_df, on="well", how="inner")
+        .merge(coords, on="well", how="inner")
         .dropna(subset=["lat", "lon", "level"])
     )
 
-    if month_long.empty:
-        st.warning("No matching wells between level and coordinate files.")
+    if df_month.empty:
+        st.warning("No matching well names between the two CSV files.")
         st.stop()
 
-    # ---- RBF interpolation -------------------------------------------------
-    lon = month_long["lon"].to_numpy(float)
-    lat = month_long["lat"].to_numpy(float)
-    z   = month_long["level"].to_numpy(float)
+    # ---- Interpolate surface ---------------------------------------------
+    lon_arr = df_month["lon"].to_numpy(float)
+    lat_arr = df_month["lat"].to_numpy(float)
+    z_arr = df_month["level"].to_numpy(float)
 
-    grid_lon, grid_lat, grid_z = rbf_interpolate(lon, lat, z, grid_res)
+    lon_g, lat_g, z_g = rbf_surface(lon_arr, lat_arr, z_arr, grid_res)
 
-    # ---- Plot --------------------------------------------------------------
+    # ---- Plot -------------------------------------------------------------
     fig, ax = plt.subplots()
     cf = ax.contourf(
-        grid_lon,
-        grid_lat,
-        grid_z,
-        levels=contour_levels,
+        lon_g,
+        lat_g,
+        z_g,
+        levels=n_levels,
+        cmap="viridis",
         alpha=0.75,
     )
-    scat = ax.scatter(
-        lon,
-        lat,
-        c=z,
+    ax.scatter(
+        lon_arr,
+        lat_arr,
+        c=z_arr,
         edgecolors="black",
         s=80,
         label="Wells",
     )
-    ax.set_aspect("equal")
+    ax.set_aspect("equal", "box")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
-    ax.set_title(f"Water-Table Surface — {date_choice}")
-    cbar = fig.colorbar(cf, ax=ax, label="Water level")
+    ax.set_title(f"Water-Table Surface — {date_sel}")
+    fig.colorbar(cf, ax=ax, label="Water level")
     ax.legend()
-
     st.pyplot(fig, clear_figure=True)
 
-    # ---- Raw data table ----------------------------------------------------
+    # ---- Data table -------------------------------------------------------
     with st.expander("Show raw data for this month"):
         st.dataframe(
-            month_long[["well", "lat", "lon", "level"]]
+            df_month[["well", "lat", "lon", "level"]]
             .set_index("well")
             .sort_index(),
             use_container_width=True,

@@ -1,9 +1,9 @@
 """
-2-D water-table map (thin-plate-spline RBF) – Streamlit
+2-D water-table surface (RBF) – Streamlit
 
-Data pulled live from your GitHub repo:
-  • Monthly_Sea_Level_Data.csv  – water levels (Date, W1…W20)
-  • wells.csv                   – well coordinates & metadata
+Data sources pulled live from GitHub:
+  • Water levels : Monthly_Sea_Level_Data.csv
+  • Well coords  : wells.csv
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from scipy.interpolate import Rbf
 
+# ---------------------------------------------------------------------------
+# Raw URLs
 # ---------------------------------------------------------------------------
 
 LEVELS_URL = (
@@ -26,43 +28,58 @@ COORDS_URL = (
 )
 
 # ---------------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------------
 
 
 @st.cache_data
 def load_levels() -> pd.DataFrame:
-    """Read monthly water levels and parse the Date column."""
+    """Monthly levels (Date, W1…Wn)."""
     return pd.read_csv(LEVELS_URL, parse_dates=["Date"])
 
 
 @st.cache_data
 def load_coords() -> pd.DataFrame:
     """
-    Read well-coordinate file and normalise column names.
+    Well coordinates & IDs.  Handles many column spellings and avoids duplicates.
 
-    Accepts any of these (case-insensitive):
-      • ID  : well, well_name, no, id
-      • Lat : lat, latitude, y, northing
-      • Lon : lon, lng, longitude, x, easting
+    ID synonyms  : well | no | id | well_name  
+    Lat synonyms : lat  | latitude | y | northing  
+    Lon synonyms : lon  | lng | longitude | x | easting
     """
     df = pd.read_csv(COORDS_URL)
 
-    # --- Map possible names to canonical ones ------------------------------
+    id_syn   = {"well", "no", "id", "well_name"}
+    lat_syn  = {"lat", "latitude", "y", "northing"}
+    lon_syn  = {"lon", "lng", "longitude", "x", "easting"}
+
     rename = {}
+    id_done = lat_done = lon_done = False
+
     for col in df.columns:
         c = col.lower()
-        if c in {"well", "well_name", "no", "id"}:
+
+        if c in id_syn and not id_done:
             rename[col] = "well"
-        elif c in {"lat", "latitude", "y", "northing"}:
+            id_done = True
+        elif c in lat_syn and not lat_done:
             rename[col] = "lat"
-        elif c in {"lon", "lng", "longitude", "x", "easting"}:
+            lat_done = True
+        elif c in lon_syn and not lon_done:
             rename[col] = "lon"
+            lon_done = True
+        # any further duplicates are ignored (left with original name)
+
     df = df.rename(columns=rename)
 
-    # --- Verify we now have the required columns ---------------------------
+    # Drop any duplicate columns that still share a name
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+
+    # Sanity check
     missing = {"well", "lat", "lon"} - set(df.columns)
     if missing:
         st.error(
-            "`wells.csv` must contain well IDs and coordinates. "
+            "The well-coordinate file must provide ID and coordinates. "
             f"Missing column(s): {', '.join(sorted(missing))}"
         )
         st.stop()
@@ -70,8 +87,13 @@ def load_coords() -> pd.DataFrame:
     return df[["well", "lat", "lon"]]
 
 
+# ---------------------------------------------------------------------------
+# Interpolation helper
+# ---------------------------------------------------------------------------
+
+
 def rbf_surface(lon: np.ndarray, lat: np.ndarray, z: np.ndarray, res: int):
-    """Return (lon_grid, lat_grid, z_grid) via thin-plate-spline RBF."""
+    """Thin-plate-spline RBF -> regular meshgrid."""
     rbf = Rbf(lon, lat, z, function="thin_plate")
     lon_g, lat_g = np.meshgrid(
         np.linspace(lon.min(), lon.max(), res),
@@ -82,36 +104,38 @@ def rbf_surface(lon: np.ndarray, lat: np.ndarray, z: np.ndarray, res: int):
 
 
 # ---------------------------------------------------------------------------
+# Streamlit app
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    st.title("2-D Water-Table Surface (RBF)")
+    st.title("2-D Water-Table Map (RBF)")
     st.caption(
         "Interpolates wells **W1–W20** for any month using a thin-plate-spline "
         "Radial Basis Function surface."
     )
 
     # ---- Load data --------------------------------------------------------
-    levels_df = load_levels()
-    coords_df = load_coords()
-    well_cols = [c for c in levels_df.columns if c.upper().startswith("W")]
+    levels = load_levels()
+    coords = load_coords()
+    well_cols = [c for c in levels.columns if c.upper().startswith("W")]
 
     if not well_cols:
         st.error("No well columns (W1 … Wn) found in the levels CSV.")
         st.stop()
 
-    # ---- Sidebar ----------------------------------------------------------
+    # ---- Sidebar controls -------------------------------------------------
     st.sidebar.header("Controls")
-    date_strings = levels_df["Date"].dt.strftime("%Y-m-d")
-    date_sel = st.sidebar.selectbox("Month", date_strings, index=len(date_strings) - 1)
+    date_opts = levels["Date"].dt.strftime("%Y-m-d")
+    date_sel = st.sidebar.selectbox("Month", date_opts, index=len(date_opts) - 1)
     grid_res = st.sidebar.slider("Grid resolution (pixels)", 100, 500, 250, 50)
     n_levels = st.sidebar.slider("Contour levels", 5, 30, 15, 1)
 
-    # ---- Select month & merge --------------------------------------------
-    levels_row = levels_df.loc[date_strings == date_sel, well_cols].iloc[0]
+    # ---- Merge chosen month with coords -----------------------------------
+    row = levels.loc[date_opts == date_sel, well_cols].iloc[0]
     month_df = (
-        levels_row.rename_axis("well")
+        row.rename_axis("well")
         .reset_index(name="level")
-        .merge(coords_df, on="well", how="inner")
+        .merge(coords, on="well", how="inner")
         .dropna(subset=["lat", "lon", "level"])
     )
 
@@ -119,7 +143,7 @@ def main() -> None:
         st.warning("No matching wells between level and coordinate files.")
         st.stop()
 
-    # ---- Interpolate ------------------------------------------------------
+    # ---- Interpolate surface ---------------------------------------------
     lon = month_df["lon"].to_numpy(float)
     lat = month_df["lat"].to_numpy(float)
     z   = month_df["level"].to_numpy(float)
@@ -152,7 +176,7 @@ def main() -> None:
     ax.legend()
     st.pyplot(fig, clear_figure=True)
 
-    # ---- Table ------------------------------------------------------------
+    # ---- Data table -------------------------------------------------------
     with st.expander("Raw data for this month"):
         st.dataframe(
             month_df[["well", "lat", "lon", "level"]]

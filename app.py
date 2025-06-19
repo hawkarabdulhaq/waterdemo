@@ -1,101 +1,158 @@
+"""
+Streamlit 2-D RBF interpolation of monthly water-level data.
 
-import streamlit as st
-import pandas as pd
+Data:
+- Water levels:   Monthly_Sea_Level_Data.csv  (columns: Date, W1…W20)
+- Well coords:    wells.csv  (columns: well, lat, lon)
+
+Author: <your-name>
+"""
+
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+import streamlit as st
 from scipy.interpolate import Rbf
 
-# Optional: install pykrige locally if available
-try:
-    from pykrige.ok import OrdinaryKriging
-    HAVE_PYKRIGE = True
-except ImportError:
-    HAVE_PYKRIGE = False
+# ---------------------------------------------------------------------------
 
-RAW_URL = "https://raw.githubusercontent.com/hawkarabdulhaq/waterdemo/main/Monthly_Sea_Level_Data.csv"
+LEVELS_URL = (
+    "https://raw.githubusercontent.com/"
+    "hawkarabdulhaq/waterdemo/main/Monthly_Sea_Level_Data.csv"
+)
+COORDS_URL = (
+    "https://raw.githubusercontent.com/"
+    "hawkarabdulhaq/waterdemo/main/wells.csv"
+)
+
+# ---------------------------------------------------------------------------
+
 
 @st.cache_data
-def load_data():
-    df = pd.read_csv(RAW_URL, parse_dates=['Date'])
-    # Ensure numeric columns
-    well_cols = [c for c in df.columns if c.startswith('W')]
-    df[well_cols] = df[well_cols].apply(pd.to_numeric, errors='coerce')
+def load_levels() -> pd.DataFrame:
+    df = pd.read_csv(LEVELS_URL, parse_dates=["Date"])
     return df
 
-def main():
-    st.title("Water‑Level Interpolation (RBF / Kriging)")
-    st.markdown(
-        """This Streamlit app downloads the **Monthly_Sea_Level_Data.csv** from the GitHub repo  
-        and lets you interactively interpolate water‑level measurements from wells **W1–W20**  
-        for any given month using either Radial Basis Function (RBF) or Ordinary Kriging."""
+
+@st.cache_data
+def load_coords() -> pd.DataFrame:
+    df = pd.read_csv(COORDS_URL)
+
+    # --- Rename to canonical columns ---------------------------------------
+    rename_map = {}
+    for col in df.columns:
+        c = col.lower()
+        if c in {"well", "name", "id"}:
+            rename_map[col] = "well"
+        elif c in {"lat", "latitude", "y"}:
+            rename_map[col] = "lat"
+        elif c in {"lon", "lng", "longitude", "x"}:
+            rename_map[col] = "lon"
+    df = df.rename(columns=rename_map)
+
+    needed = {"well", "lat", "lon"}
+    if not needed.issubset(df.columns):
+        missing = ", ".join(sorted(needed - set(df.columns)))
+        st.error(f"`wells.csv` is missing column(s): {missing}")
+        st.stop()
+
+    return df[["well", "lat", "lon"]]
+
+
+def rbf_interpolate(lon, lat, z, grid_res=200):
+    """Return (grid_lon, grid_lat, grid_z) on regular mesh via thin-plate RBF."""
+    rbf = Rbf(lon, lat, z, function="thin_plate")
+
+    lon_min, lon_max = lon.min(), lon.max()
+    lat_min, lat_max = lat.min(), lat.max()
+    grid_lon, grid_lat = np.meshgrid(
+        np.linspace(lon_min, lon_max, grid_res),
+        np.linspace(lat_min, lat_max, grid_res),
+    )
+    grid_z = rbf(grid_lon, grid_lat)
+    return grid_lon, grid_lat, grid_z
+
+
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    st.title("2-D Water-Table Interpolation (RBF)")
+
+    st.caption(
+        "Plots a thin-plate-spline surface from wells **W1–W20** for any month."
     )
 
-    df = load_data()
-    well_cols = [c for c in df.columns if c.startswith('W')]
+    # ---- Load data ---------------------------------------------------------
+    levels_df = load_levels()
+    coords_df = load_coords()
 
-    # --- Sidebar controls ---------------------------------------------------
+    well_cols = [c for c in levels_df.columns if c.startswith("W")]
+    if len(well_cols) == 0:
+        st.error("No well columns (W1…Wn) found in levels CSV.")
+        st.stop()
+
+    # ---- Sidebar controls --------------------------------------------------
     st.sidebar.header("Controls")
-    date_choice = st.sidebar.selectbox(
-        "Select month",
-        df["Date"].dt.strftime("%Y‑m‑d"),
-        index=len(df) - 1  # default = most recent
-    )
-    method = st.sidebar.radio(
-        "Interpolation method",
-        ("RBF", "Ordinary Kriging" if HAVE_PYKRIGE else "Ordinary Kriging (pykrige not installed)"),
-        index=0,
-        help="Install `pykrige` if you’d like to use ordinary kriging."
-    )
-    resolution = st.sidebar.slider(
-        "Interpolation resolution (grid points)",
-        min_value=50,
-        max_value=400,
-        value=200,
-        step=25
+    date_strings = levels_df["Date"].dt.strftime("%Y-m-d")
+    date_choice = st.sidebar.selectbox("Month", date_strings, index=len(date_strings) - 1)
+    grid_res = st.sidebar.slider("Grid resolution (pixels)", 100, 400, 250, 50)
+    contour_levels = st.sidebar.slider("Contour levels", 5, 30, 15, 1)
+
+    # ---- Extract selected month -------------------------------------------
+    month_data = levels_df.loc[date_strings == date_choice, well_cols].iloc[0]
+    month_long = (
+        month_data.rename_axis("well")
+        .reset_index(name="level")
+        .merge(coords_df, on="well", how="inner")
+        .dropna(subset=["lat", "lon", "level"])
     )
 
-    # --- Prepare data -------------------------------------------------------
-    row = df[df["Date"].dt.strftime("%Y‑m‑d") == date_choice].iloc[0]
-    x = np.arange(1, len(well_cols) + 1)               # well index as 1‑D coordinate
-    y = row[well_cols].values.astype(float)
+    if month_long.empty:
+        st.warning("No matching wells between level and coordinate files.")
+        st.stop()
 
-    grid_x = np.linspace(x.min(), x.max(), resolution)
+    # ---- RBF interpolation -------------------------------------------------
+    lon = month_long["lon"].to_numpy(float)
+    lat = month_long["lat"].to_numpy(float)
+    z   = month_long["level"].to_numpy(float)
 
-    # --- Interpolation ------------------------------------------------------
-    if method.startswith("RBF"):
-        rbf = Rbf(x, y, function="thin_plate")
-        z = rbf(grid_x)
-    else:
-        if not HAVE_PYKRIGE:
-            st.error("pykrige not installed. Please `pip install pykrige` in your environment.")
-            st.stop()
-        # pykrige expects 2‑D coordinates; pass zeros for Y
-        ok = OrdinaryKriging(
-            x, np.zeros_like(x), y,
-            variogram_model="linear",
-            verbose=False, enable_plotting=False
-        )
-        z, ss = ok.execute("grid", grid_x, np.array([0.0]))
-        z = z[:, 0]
+    grid_lon, grid_lat, grid_z = rbf_interpolate(lon, lat, z, grid_res)
 
-    # --- Plot ---------------------------------------------------------------
+    # ---- Plot --------------------------------------------------------------
     fig, ax = plt.subplots()
-    ax.plot(x, y, "o", label="Observed wells")
-    ax.plot(grid_x, z, "-", label=f"{method} interpolation")
-    ax.set(
-        xlabel="Well index",
-        ylabel="Water level (units)",
-        title=f"Interpolated profile – {date_choice}"
+    cf = ax.contourf(
+        grid_lon,
+        grid_lat,
+        grid_z,
+        levels=contour_levels,
+        alpha=0.75,
     )
+    scat = ax.scatter(
+        lon,
+        lat,
+        c=z,
+        edgecolors="black",
+        s=80,
+        label="Wells",
+    )
+    ax.set_aspect("equal")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(f"Water-Table Surface — {date_choice}")
+    cbar = fig.colorbar(cf, ax=ax, label="Water level")
     ax.legend()
+
     st.pyplot(fig, clear_figure=True)
 
-    # --- Data table ---------------------------------------------------------
+    # ---- Raw data table ----------------------------------------------------
     with st.expander("Show raw data for this month"):
         st.dataframe(
-            pd.DataFrame({"well": well_cols, "value": y}).set_index("well"),
-            use_container_width=True
+            month_long[["well", "lat", "lon", "level"]]
+            .set_index("well")
+            .sort_index(),
+            use_container_width=True,
         )
+
 
 if __name__ == "__main__":
     main()
